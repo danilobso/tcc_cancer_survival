@@ -26,7 +26,7 @@ class SurvivalLib():
         print('Initializing...')
         self.df = df
         self.target = target_col
-        self.features = [col for col in df.columns.tolist() 
+        self.features = [col for col in df.columns.tolist()
                             if col not in del_features]
         self.event = 'EVENT'
         self.df[self.event] = df['OVERALL_SURVIVAL_STATUS'].apply(
@@ -128,8 +128,8 @@ class SurvivalLib():
         else:
             return True
 
-    def cv_survival(self, cv=10, params={}, return_model=False, 
-                        num_trees=1000, verbose=True):
+    def cv_survival(self, cv=10, params={}, num_trees=1000, 
+                    balance_classes=True, verbose=True, ):
 
         self.verify_best_num_feats()
 
@@ -160,9 +160,12 @@ class SurvivalLib():
             X_train = X_train[self.best_features[:self.best_num_feats]]
             X_test = X_test[self.best_features[:self.best_num_feats]]
 
-            weights = compute_sample_weight('balanced', E_train)
-            weights = weights / df_cv.shape[0]
-            weights[0] += 1 - sum(weights)
+            weights = None
+
+            if balance_classes:
+                weights = compute_sample_weight('balanced', E_train)
+                weights = weights / df_cv.shape[0]
+                weights[0] += 1 - sum(weights)
             
             model_forest = ConditionalSurvivalForestModel(num_trees=num_trees,)
             model_forest.fit(X_train, T_train, E_train, seed=42, weights=weights, **params)
@@ -170,15 +173,18 @@ class SurvivalLib():
             datasets.append([X_test, T_test, E_test])
             scores.append(concordance_index(model_forest, X_test, T_test, E_test))
 
-        if return_model:
-            scores = np.array(scores)
-            best_run = np.where(scores == max(scores))[0][0]
-            best_model = models[best_run]
-            best_datasets = datasets[best_run]
-            return best_model, best_datasets, np.mean(scores)
-        else:
-            return np.mean(scores)
+        scores = np.array(scores)
+        best_run = np.where(scores == max(scores))[0][0]
+        best_model = models[best_run]
+        best_datasets = datasets[best_run]
+        self.model_forest = best_model
+        self.X_test, self.T_test, self.E_test = best_datasets
+        print('CV Score: {:.3f}'.format(np.mean(scores)))
+        
 
+    def get_c_index(self):
+        return concordance_index(self.model_forest, self.X_test, 
+                                    self.T_test, self.E_test)
 
     def brute_force_num_features(self, min_feats=10, max_feats=150, verbose=True):
         '''
@@ -197,12 +203,13 @@ class SurvivalLib():
         best_res = 0
         best_feats = 0
         for num_feats in range(min_feats, max_feats, 10):
-            c_index = self.cv_survival(df, cv=10, num_feats=num_feats, num_trees=1000)
+            self.set_best_num_feats(num_feats)
+            c_index = self.cv_survival(verbose=False)
             if c_index > best_res:
                 best_res = c_index
                 best_feats = num_feats
                 if verbose: 
-                    print('CV Score: {:.2f} Number of features: {}'.format(best_res, min_feats))        
+                    print('CV Score: {:.3f} Number of features: {}'.format(best_res, best_feats))        
 
         self.set_best_num_feats(best_feats)
         self._num_feats_optimized = True
@@ -211,16 +218,48 @@ class SurvivalLib():
             print('Done optimizing.')
 
 
+    def check_not_censored(self, sample):
+        if self.E_test[sample.name]:
+            return True
+        else:
+            return False
 
 
+    def predict_survival_all_times(self, sample, x_resolution=20):
+        if self.check_not_censored(sample):
+            preds = self.model_forest.predict_survival(sample)
+            if isinstance(preds, np.ndarray):
+                return preds[0]
+            else:
+                return None
 
 
+    def predict(self):
+        res = self.X_test.apply(lambda x: self.predict_survival_all_times(x), axis=1)
+        self.preds = res
+        return res
 
 
-
-
-
-
+    def plot_prediction(self):
+        event_times = self.T_test[np.where(self.E_test == 1)[0]]
+        f, ax = plt.subplots(figsize=(10,10))
+        i=0
+        count_right = 0
+        for pred in self.preds:
+            if isinstance(pred, np.ndarray):
+                if self.model_forest.times[np.argwhere(self.preds[0]<=0.5)[0][0]] <= event_times[i]:
+                    plt.plot(self.model_forest.times, pred, color='green')            
+                    plt.scatter(event_times[i], 0.5, color='green')
+                    count_right += 1
+                else:
+                    plt.scatter(event_times[i], 0.5, color='red')
+                    plt.plot(self.model_forest.times, pred, color='red')
+                i += 1
+        print('Correct guesses: {:.2f}%'.format((count_right / i) * 100))
+        ax.set_ylabel('Probabilidade de sobrevivência')
+        ax.set_xlabel('Tempo em meses após primeiro diagnóstico')
+        ax.set_title('Comparação de curvas de sobrevivência para pacientes não censored')
+        plt.show()
 
 
 
