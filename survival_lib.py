@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 
+import joblib
+
 # Full power to apply funcs
 from functools import partial
 from multiprocessing import Pool, cpu_count
@@ -10,6 +12,7 @@ from matplotlib import pyplot as plt
 
 # Sklearn
 from sklearn.model_selection import KFold
+from sklearn.model_selection import ParameterGrid
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import QuantileTransformer
 from sklearn.utils.class_weight import compute_sample_weight
@@ -22,17 +25,31 @@ from pysurvival.utils.display import compare_to_actual, integrated_brier_score, 
 
 class SurvivalLib():
 
-    def __init__(self, df, target_col, del_features, feature_importance=None):
+    def __init__(self,
+                 df,
+                 target_col,
+                 del_features,
+                 feature_importance=None,
+                 best_num_feats=0):
+
         print('Initializing...')
         self.df = df
         self.target = target_col
         self.features = [col for col in df.columns.tolist()
                             if col not in del_features]
+
+        # Create event column
         self.event = 'EVENT'
-        self.df[self.event] = df['OVERALL_SURVIVAL_STATUS'].apply(
+        self.df[self.event] = self.df['OVERALL_SURVIVAL_STATUS'].apply(
                                 lambda x: 1 if x == 'DECEASED' else 0)
-        self.best_num_feats = 0
-        self._num_feats_optimized = False
+
+        # Fix best number of features
+        if best_num_feats == 0:
+            self.best_num_feats = 50
+            self._num_feats_optimized = False
+        else:
+            self.best_num_feats = best_num_feats
+            self._num_feats_optimized = True
 
         self.del_features = del_features
 
@@ -42,7 +59,10 @@ class SurvivalLib():
             print('by calling SurvivalLib.process_feature_importance,')
             print('after cleaning data.')
 
+        self.best_params = {}
+
         self.test_size = 0.2
+
 
         print('Done Initializing.')
 
@@ -116,6 +136,12 @@ class SurvivalLib():
             print('Shape after filtering time-axis: ', self.df.shape)
 
 
+    def check_params(self, params):
+        if not params:
+            return self.best_params
+        else:
+            return params
+
     def process_feature_importance(self, num_trees=4000, params={},
                                     balance_classes=True, verbose=True,):
         """
@@ -124,7 +150,10 @@ class SurvivalLib():
 
         """
 
+        params = self.check_params(params)
+
         print('Started processing feature importance. This may take a while.')
+
         df = self.df.copy()
         dummies = list(filter(lambda x: x not in self.del_features,
                               self.df.dtypes.loc[self.df.dtypes == 'object'].index))
@@ -133,27 +162,20 @@ class SurvivalLib():
         N = df.shape[0]
         features_new = [e for e in df.columns.tolist() if e not in self.del_features]
 
-        index_train, index_test = train_test_split(range(N),
-                                           test_size = self.test_size,
-                                           random_state=42)
-
-        data_train = df.iloc[index_train].reset_index( drop = True )
-        data_test  = df.iloc[index_test].reset_index( drop = True )
-
         # Creating the X, T and E inputs
-        X_train, X_test = data_train[features_new], data_test[features_new]
-        T_train, T_test = data_train[self.target].values, data_test[self.target].values
-        E_train, E_test = data_train[self.event].values, data_test[self.event].values
+        X = df[features_new]
+        T = df[self.target].values
+        E = df[self.event].values
 
         weights = None
 
         if balance_classes:
-            weights = compute_sample_weight('balanced', E_train)
+            weights = compute_sample_weight('balanced', E)
             weights = weights / df.shape[0]
             weights[0] += 1 - sum(weights)
 
         model_forest = ConditionalSurvivalForestModel(num_trees=num_trees,)
-        model_forest.fit(X_train, T_train, E_train, seed=42, weights=weights, **params)
+        model_forest.fit(X, T, E, seed=42, weights=weights, **params)
 
         self.set_feature_importance(model_forest.variable_importance_table['feature'])
 
@@ -179,7 +201,7 @@ class SurvivalLib():
         being used, by checking the private variable _num_feats_optimized.
         If it's not optimized, the variable is initialized with 50.
         '''
-        if self.best_num_feats == 0 | self._num_feats_optimized == False:
+        if (self.best_num_feats == 0) | (self._num_feats_optimized == False):
             print('Warning! Run function brute_force_num_features for best results! ' +
                     'Using default value of 50.')
             self.set_best_num_feats(50)
@@ -203,11 +225,11 @@ class SurvivalLib():
         df_cv = pd.get_dummies(df_cv, columns=dummies).reset_index(drop=True)
 
         features_new = [e for e in df_cv.columns.tolist() if e not in self.del_features]
-        fold = 0
-        for index_train, index_test in kf.split(df_cv):
+
+        for fold, (index_train, index_test) in enumerate(kf.split(df_cv), 1):
             if verbose:
-                print('Fold {}'.format(fold + 1))
-                fold += 1
+                print('Fold {}'.format(fold))
+
             data_train = df_cv.iloc[index_train].reset_index( drop = True )
             data_test  = df_cv.iloc[index_test].reset_index( drop = True )
 
@@ -238,12 +260,53 @@ class SurvivalLib():
         best_datasets = datasets[best_run]
         self.model_forest = best_model
         self.X_test, self.T_test, self.E_test = best_datasets
-        print('CV Score: {:.3f}'.format(np.mean(scores)))
+        self.cv_mean = np.mean(scores)
+        if verbose:
+            print('CV Score: {:.3f}'.format(self.cv_mean))
 
+    def get_cv_mean(self):
+        return self.cv_mean
 
     def get_c_index(self):
         return concordance_index(self.model_forest, self.X_test,
                                     self.T_test, self.E_test)
+
+    def optimize_hyperparams(self, verbose=True,):
+        """
+        Hyperparameter optimization. Default values are as follow:
+
+        param_grid = {
+            'min_node_size':[10],
+            'max_depth':[5],
+            'max_features':['sqrt']
+            'minprop':[0.1],
+            'alpha':[0.5],
+            'sample_size_pct':[0.63],
+            'importance_mode':['normalized_permutation']
+        }
+        """
+
+        param_grid = {
+            'min_node_size':[5, 7, 10],
+            'max_depth':[4, 5, 6],
+            'max_features':['sqrt'],
+            'minprop':[0.1],
+            'alpha':[0.4, 0.5, 0.6],
+            'sample_size_pct':[0.63],
+            'importance_mode':['normalized_permutation']
+        }
+
+        grid = ParameterGrid(param_grid)
+        max_c_index = 0
+        for i, params in enumerate(grid):
+            self.cv_survival(cv=5, verbose=False, params=params)
+            c_index = self.get_cv_mean()
+            if c_index > max_c_index:
+                max_c_index = c_index
+                self.best_params = params
+                if verbose:
+                    print('CV Score: {:.3f}'.format(max_c_index))
+        print(self.best_params)
 
     def brute_force_num_features(self, min_feats=10, max_feats=150, verbose=True):
         '''
@@ -259,11 +322,14 @@ class SurvivalLib():
         '''
         if verbose:
             print('Running number of features optimization...')
+
+        self._num_feats_optimized = True
         best_res = 0
         best_feats = 0
         for num_feats in range(min_feats, max_feats, 10):
             self.set_best_num_feats(num_feats)
-            c_index = self.cv_survival(verbose=False)
+            self.cv_survival(verbose=False)
+            c_index = self.get_cv_mean()
             if c_index > best_res:
                 best_res = c_index
                 best_feats = num_feats
@@ -271,10 +337,9 @@ class SurvivalLib():
                     print('CV Score: {:.3f} Number of features: {}'.format(best_res, best_feats))
 
         self.set_best_num_feats(best_feats)
-        self._num_feats_optimized = True
 
         if verbose:
-            print('Done optimizing.')
+            print('Done optimizing. Best number of features: {}'.format(best_feats))
 
 
     def check_not_censored(self, sample):
@@ -317,8 +382,8 @@ class SurvivalLib():
     def predict_risk(self):
         res = self.predict_risk_all_samples(self.X_test)
         self.risk_preds = self.X_test.apply(lambda x: self.predict_survival_all_times(x), axis=1)
-        self.high_risk = np.where(res > np.mean(res))[0]
-        self.low_risk = np.where(res <= np.mean(res))[0]
+        self.high_risk = np.where(res > np.median(res))[0]
+        self.low_risk = np.where(res <= np.median(res))[0]
         self.plot_risk()
         return res
 
@@ -393,9 +458,35 @@ class SurvivalLib():
         ax.set_title('Comparação de curvas de sobrevivência para pacientes não censored')
         plt.show()
 
+    def integrated_brier_score(self):
+        integrated_brier_score(self.model_forest, self.X_test, self.T_test, self.E_test,
+                                figure_size=(15,5))
+
+    def compare_to_actual(self, is_at_risk=False):
+        results = compare_to_actual(self.model_forest, self.X_test, self.T_test, self.E_test,
+                            is_at_risk = is_at_risk,  figure_size=(16, 6),
+                            metrics = ['rmse', 'mean', 'median'])
 
 
+    def plot_kaplan(self):
+        e_samples = list(self.X_test[self.X_test.apply(lambda sample: self.check_not_censored(sample), axis=1)].index)
+        total_samples = len(e_samples)
 
+        t_samples = []
 
+        for time_bucket in self.model_forest.times:
 
+            # Append current number of pacients
+            t_samples.append(total_samples)
 
+            # Verify if any event ocurred
+            for sample in e_samples:
+                if self.T_test[sample] <= time_bucket:
+
+                    # Reduce total number of pacients
+                    total_samples -= 1
+
+                    # Remove this sample from list of samples
+                    e_samples.remove(sample)
+
+        plt.plot(self.model_forest.times, t_samples)
