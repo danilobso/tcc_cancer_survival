@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-import joblib
+import sys
 
 # Full power to apply funcs
 from functools import partial
@@ -15,6 +15,7 @@ from sklearn.model_selection import KFold
 from sklearn.model_selection import ParameterGrid
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import QuantileTransformer
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.utils.class_weight import compute_sample_weight
 
 # PySurvival
@@ -30,13 +31,15 @@ class SurvivalLib():
                  target_col,
                  del_features,
                  feature_importance=None,
-                 best_num_feats=0):
+                 best_num_feats=0,
+                 params={}):
 
         print('Initializing...')
         self.df = df
         self.target = target_col
-        self.features = [col for col in df.columns.tolist()
-                            if col not in del_features]
+
+        # Features will be processed after dumming columns
+        self.features = []
 
         # Create event column
         self.event = 'EVENT'
@@ -59,12 +62,38 @@ class SurvivalLib():
             print('by calling SurvivalLib.process_feature_importance,')
             print('after cleaning data.')
 
-        self.best_params = {}
+        self.best_params = params
 
         self.test_size = 0.2
 
+        self.seed = 42
 
         print('Done Initializing.')
+
+    def data_split(self, verbose=True):
+        """
+        Function to separate data into train and test sets.
+        All optimizations are done using train set, and
+        all model evaluations are done using the test set.
+        """
+
+        dummies = list(filter(lambda x: x not in self.del_features,
+                              self.df.dtypes.loc[self.df.dtypes == 'object'].index))
+
+        self.df = pd.get_dummies(self.df, columns=dummies).reset_index(drop=True)
+
+        self.features = [e for e in self.df.columns.tolist() if e not in self.del_features]
+
+        df_train, df_test = train_test_split(self.df,
+                                             test_size=self.test_size,
+                                             shuffle=True,
+                                             random_state=self.seed,
+                                             stratify=self.df[self.event])
+        self.df_train = df_train.reset_index(drop=True)
+        self.df_test = df_test.reset_index(drop=True)
+
+        if verbose:
+            print('Data splited into train and test sets.')
 
     def reset_index(self):
         self.df = self.df.reset_index(drop=True)
@@ -92,6 +121,8 @@ class SurvivalLib():
 
         self.reset_index()
 
+        self.data_split(verbose)
+
         if verbose:
             print('Data cleaned.')
 
@@ -106,6 +137,15 @@ class SurvivalLib():
         '''
         return self.df
 
+    def get_X_test(self):
+        return self.df_test[self.feature_importance[:self.best_num_feats]]
+
+    def get_T_test(self):
+        return self.df_test[self.target].values
+
+    def get_E_test(self):
+        return self.df_test[self.event].values
+
     def remove_missing_data(self, verbose=True):
 
         na_cols = self.df.isna().any().reset_index()
@@ -116,7 +156,7 @@ class SurvivalLib():
 
         self.df = self.df.drop(self.columns_to_drop, axis=1).dropna()
 
-        # Fixing spaces on therapy columns
+        # Fixing spaces on columns to be One Hot Encoded
         dummies = list(filter(lambda x: x not in self.del_features,
                               self.df.dtypes.loc[self.df.dtypes == 'object'].index))
         for col in dummies:
@@ -146,7 +186,8 @@ class SurvivalLib():
                                     balance_classes=True, verbose=True,):
         """
         Function to process the feature importance, in order to
-        operate the library with a reduced number.
+        operate the library with a reduced number of features,
+        a way to addess the curse of dimentionality.
 
         """
 
@@ -155,15 +196,9 @@ class SurvivalLib():
         print('Started processing feature importance. This may take a while.')
 
         df = self.df.copy()
-        dummies = list(filter(lambda x: x not in self.del_features,
-                              self.df.dtypes.loc[self.df.dtypes == 'object'].index))
-
-        df = pd.get_dummies(df, columns=dummies).reset_index(drop=True)
-        N = df.shape[0]
-        features_new = [e for e in df.columns.tolist() if e not in self.del_features]
 
         # Creating the X, T and E inputs
-        X = df[features_new]
+        X = df[self.features]
         T = df[self.target].values
         E = df[self.event].values
 
@@ -175,7 +210,7 @@ class SurvivalLib():
             weights[0] += 1 - sum(weights)
 
         model_forest = ConditionalSurvivalForestModel(num_trees=num_trees,)
-        model_forest.fit(X, T, E, seed=42, weights=weights, **params)
+        model_forest.fit(X, T, E, seed=self.seed, weights=weights, **params)
 
         self.set_feature_importance(model_forest.variable_importance_table['feature'])
 
@@ -209,22 +244,31 @@ class SurvivalLib():
         else:
             return True
 
+    def compute_event_weights(self, df, balance_classes=True):
+        weights = None
+
+        if balance_classes:
+            weights = compute_sample_weight('balanced', df)
+            weights = weights / df.shape[0]
+            #weights[0] += 1 - sum(weights)
+
+        return weights
+
     def cv_survival(self, cv=10, params={}, num_trees=1000,
                     balance_classes=True, verbose=True, ):
 
         self.verify_best_num_feats()
 
-        kf = KFold(n_splits=cv, shuffle=True, random_state=42)
+        # Check if the best hyperparameters were processed
+        params = self.check_params(params)
+
+        kf = KFold(n_splits=cv, shuffle=True, random_state=self.seed)
+
         scores = []
         models = []
         datasets = []
-        df_cv = self.df.copy()
-        dummies = list(filter(lambda x: x not in self.del_features,
-                              self.df.dtypes.loc[self.df.dtypes == 'object'].index))
 
-        df_cv = pd.get_dummies(df_cv, columns=dummies).reset_index(drop=True)
-
-        features_new = [e for e in df_cv.columns.tolist() if e not in self.del_features]
+        df_cv = self.df_train.copy()
 
         for fold, (index_train, index_test) in enumerate(kf.split(df_cv), 1):
             if verbose:
@@ -234,42 +278,73 @@ class SurvivalLib():
             data_test  = df_cv.iloc[index_test].reset_index( drop = True )
 
             # Creating the X, T and E inputs
-            X_train, X_test = data_train[features_new], data_test[features_new]
+            X_train, X_test = data_train[self.features], data_test[self.features]
             T_train, T_test = data_train[self.target].values, data_test[self.target].values
             E_train, E_test = data_train[self.event].values, data_test[self.event].values
 
             X_train = X_train[self.feature_importance[:self.best_num_feats]]
             X_test = X_test[self.feature_importance[:self.best_num_feats]]
 
-            weights = None
+            weights = self.compute_event_weights(E_train, balance_classes)
 
-            if balance_classes:
-                weights = compute_sample_weight('balanced', E_train)
-                weights = weights / df_cv.shape[0]
-                weights[0] += 1 - sum(weights)
-
+            # Creating model
             model_forest = ConditionalSurvivalForestModel(num_trees=num_trees,)
-            model_forest.fit(X_train, T_train, E_train, seed=42, weights=weights, **params)
-            models.append(model_forest)
-            datasets.append([X_test, T_test, E_test])
+            model_forest.fit(X_train, T_train, E_train, seed=self.seed, weights=weights, **params)
+
+            # Append score for post calculation average of folds
             scores.append(concordance_index(model_forest, X_test, T_test, E_test))
 
-        scores = np.array(scores)
-        best_run = np.where(scores == max(scores))[0][0]
-        best_model = models[best_run]
-        best_datasets = datasets[best_run]
-        self.model_forest = best_model
-        self.X_test, self.T_test, self.E_test = best_datasets
-        self.cv_mean = np.mean(scores)
-        if verbose:
-            print('CV Score: {:.3f}'.format(self.cv_mean))
+        # Refit model with all training data
+        self.fit_model(num_trees=num_trees,
+                       params=params,
+                       balance_classes=balance_classes)
 
-    def get_cv_mean(self):
-        return self.cv_mean
+        scores = np.array(scores)
+        self.cv_score = np.mean(scores)
+        if verbose:
+            print('CV Score: {:.3f}'.format(self.cv_score))
+
+    def fit_model(self,
+                  num_trees=3000,
+                  params={},
+                  balance_classes=True):
+        """
+        Function used to fit an usable model, with all
+        trainig data, after doing parameters optimization.
+        """
+
+        features = self.get_X_test()
+        target = self.get_T_test()
+        event = self.get_E_test()
+
+        weights = self.compute_event_weights(event,
+                                             balance_classes)
+
+        params = self.check_params(params)
+
+        model_forest = ConditionalSurvivalForestModel(num_trees=num_trees,)
+
+        model_forest.fit(features,
+                          target,
+                          event,
+                          seed=self.seed,
+                          weights=weights,
+                          **params)
+
+        self.model_forest = model_forest
+
+
+    def get_cv_score(self):
+        return self.cv_score
 
     def get_c_index(self):
-        return concordance_index(self.model_forest, self.X_test,
-                                    self.T_test, self.E_test)
+
+        features = self.get_X_test()
+        target = self.get_T_test()
+        event = self.get_E_test()
+
+        return concordance_index(self.model_forest, features,
+                                    target, event)
 
     def optimize_hyperparams(self, verbose=True,):
         """
@@ -288,25 +363,27 @@ class SurvivalLib():
 
         param_grid = {
             'min_node_size':[5, 7, 10],
-            'max_depth':[4, 5, 6],
+            'max_depth':[4, 5, 6, 7],
             'max_features':['sqrt'],
-            'minprop':[0.1],
-            'alpha':[0.4, 0.5, 0.6],
+            'minprop':[0.08, 0.1, 0.12],
+            'alpha':[0.4, 0.5, 0.6, 0.7],
             'sample_size_pct':[0.63],
-            'importance_mode':['normalized_permutation']
+            'importance_mode':['normalized_permutation', 'impurity']
         }
 
         grid = ParameterGrid(param_grid)
         max_c_index = 0
         for i, params in enumerate(grid):
             self.cv_survival(cv=5, verbose=False, params=params)
-            c_index = self.get_cv_mean()
+            c_index = self.get_cv_score()
             if c_index > max_c_index:
                 max_c_index = c_index
                 self.best_params = params
+                self.cv_score = max_c_index
                 if verbose:
-                    print('CV Score: {:.3f}'.format(max_c_index))
+                    print('Run: {} CV Score: {:.3f}'.format(i+1, max_c_index))
         print(self.best_params)
+        self.fit_model()
 
     def brute_force_num_features(self, min_feats=10, max_feats=150, verbose=True):
         '''
@@ -328,8 +405,8 @@ class SurvivalLib():
         best_feats = 0
         for num_feats in range(min_feats, max_feats, 10):
             self.set_best_num_feats(num_feats)
-            self.cv_survival(verbose=False)
-            c_index = self.get_cv_mean()
+            self.cv_survival(cv=5, verbose=False)
+            c_index = self.get_cv_score()
             if c_index > best_res:
                 best_res = c_index
                 best_feats = num_feats
@@ -341,9 +418,12 @@ class SurvivalLib():
         if verbose:
             print('Done optimizing. Best number of features: {}'.format(best_feats))
 
+        self.fit_model()
+
 
     def check_not_censored(self, sample):
-        if self.E_test[sample.name]:
+        event = self.df_test[self.event].values
+        if event[sample.name]:
             return True
         else:
             return False
@@ -371,7 +451,8 @@ class SurvivalLib():
         return preds
 
     def predict(self):
-        res = self.X_test.apply(lambda x: self.predict_survival_all_times(x), axis=1)
+        features = self.get_X_test()
+        res = features.apply(lambda x: self.predict_survival_all_times(x), axis=1)
         res = res[res.apply(lambda x: isinstance(x, np.ndarray))].reset_index(drop=True)
         self.preds = res
         return res
@@ -380,15 +461,21 @@ class SurvivalLib():
         return self.model_forest.predict_survival(sample)
 
     def predict_risk(self):
-        res = self.predict_risk_all_samples(self.X_test)
-        self.risk_preds = self.X_test.apply(lambda x: self.predict_survival_all_times(x), axis=1)
+
+        features = self.get_X_test()
+
+        res = self.predict_risk_all_samples(features)
+
+        self.risk_preds = features.apply(lambda x: self.predict_survival_all_times(x), axis=1)
         self.high_risk = np.where(res > np.median(res))[0]
         self.low_risk = np.where(res <= np.median(res))[0]
         self.plot_risk()
         return res
 
     def predict_hazard(self):
-        res = self.X_test.apply(lambda x: self.predict_hazard_all_times(x), axis=1)
+        features = self.get_X_test()
+
+        res = features.apply(lambda x: self.predict_hazard_all_times(x), axis=1)
         res = res[res.apply(lambda x: isinstance(x, np.ndarray))].reset_index(drop=True)
         self.hazard_preds = res
         return res
@@ -397,7 +484,11 @@ class SurvivalLib():
         return self.preds
 
     def plot_risk(self):
-        event_times = self.T_test[np.where(self.E_test == 1)[0]]
+
+        target = self.get_T_test()
+        event = self.get_E_test()
+
+        event_times = target[np.where(event == 1)[0]]
         f, ax = plt.subplots(figsize=(10,10))
 
         for pred in self.risk_preds.iloc[self.low_risk]:
@@ -406,6 +497,12 @@ class SurvivalLib():
         for pred in self.risk_preds.iloc[self.high_risk]:
             if isinstance(pred, np.ndarray):
                 plt.plot(self.model_forest.times, pred, color='red', label='Alto risco')
+
+        kaplan = self.get_kaplan_curve()
+        kaplan = kaplan.reshape(-1, 1)
+        scaler = MinMaxScaler()
+        scaled_kaplan = scaler.fit_transform(kaplan)
+        plt.plot(self.model_forest.times, scaled_kaplan, color='black')
 
         #print('Correct guesses: {:.2f}%'.format((count_right / i) * 100))
         #ax.legend()
@@ -416,7 +513,12 @@ class SurvivalLib():
 
 
     def plot_prediction(self):
-        event_times = self.T_test[np.where(self.E_test == 1)[0]]
+
+        features = self.get_X_test()
+        target = self.get_T_test()
+        event = self.get_E_test()
+
+        event_times = target[np.where(event == 1)[0]]
         f, ax = plt.subplots(figsize=(10,10))
         i=0
         count_right = 0
@@ -438,7 +540,12 @@ class SurvivalLib():
         plt.show()
 
     def plot_hazard(self):
-        event_times = self.T_test[np.where(self.E_test == 1)[0]]
+
+        features = self.get_X_test()
+        target = self.get_T_test()
+        event = self.get_E_test()
+
+        event_times = target[np.where(event == 1)[0]]
         f, ax = plt.subplots(figsize=(10,10))
         i=0
         count_right = 0
@@ -459,17 +566,29 @@ class SurvivalLib():
         plt.show()
 
     def integrated_brier_score(self):
-        integrated_brier_score(self.model_forest, self.X_test, self.T_test, self.E_test,
-                                figure_size=(15,5))
+        integrated_brier_score(self.model_forest,
+                               self.get_X_test(),
+                               self.get_T_test(),
+                               self.get_E_test(),
+                               figure_size=(15,5))
 
     def compare_to_actual(self, is_at_risk=False):
-        results = compare_to_actual(self.model_forest, self.X_test, self.T_test, self.E_test,
-                            is_at_risk = is_at_risk,  figure_size=(16, 6),
-                            metrics = ['rmse', 'mean', 'median'])
+        results = compare_to_actual(self.model_forest,
+                                    self.get_X_test(),
+                                    self.get_T_test(),
+                                    self.get_E_test(),
+                                    is_at_risk = is_at_risk,
+                                    figure_size=(16, 6),
+                                    metrics = ['rmse', 'mean', 'median'])
 
 
-    def plot_kaplan(self):
-        e_samples = list(self.X_test[self.X_test.apply(lambda sample: self.check_not_censored(sample), axis=1)].index)
+    def get_kaplan_curve(self):
+
+        features = self.get_X_test()
+        target = self.get_T_test()
+        event = self.get_E_test()
+
+        e_samples = list(features[features.apply(lambda sample: self.check_not_censored(sample), axis=1)].index)
         total_samples = len(e_samples)
 
         t_samples = []
@@ -481,7 +600,7 @@ class SurvivalLib():
 
             # Verify if any event ocurred
             for sample in e_samples:
-                if self.T_test[sample] <= time_bucket:
+                if target[sample] <= time_bucket:
 
                     # Reduce total number of pacients
                     total_samples -= 1
@@ -489,4 +608,14 @@ class SurvivalLib():
                     # Remove this sample from list of samples
                     e_samples.remove(sample)
 
+        return np.array(t_samples)
+
+    def plot_kaplan(self):
+
+        t_samples = self.get_kaplan_curve()
+        f, ax = plt.subplots(figsize=(10,10))
         plt.plot(self.model_forest.times, t_samples)
+        ax.set_ylabel('Number of current patients')
+        ax.set_xlabel('Time from first diagnosis')
+        ax.set_title('Kaplan survival function')
+        plt.show()
