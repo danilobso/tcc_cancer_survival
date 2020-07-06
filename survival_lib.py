@@ -238,12 +238,7 @@ class SurvivalLib():
         T = df[self.target].values
         E = df[self.event].values
 
-        weights = None
-
-        if balance_classes:
-            weights = compute_sample_weight('balanced', E)
-            weights = weights / df.shape[0]
-            weights[0] += 1 - sum(weights)
+        weights = self.compute_event_weights(E, balance_classes)
 
         model_forest = ConditionalSurvivalForestModel(num_trees=num_trees,)
         model_forest.fit(X, T, E, seed=self.seed, weights=weights, **params)
