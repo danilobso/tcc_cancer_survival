@@ -46,6 +46,8 @@ class SurvivalLib():
         self.df[self.event] = self.df['OVERALL_SURVIVAL_STATUS'].apply(
                                 lambda x: 1 if x == 'DECEASED' else 0)
 
+        self.suggest_max_months()
+
         # Fix best number of features
         if best_num_feats == 0:
             self.best_num_feats = 50
@@ -64,11 +66,16 @@ class SurvivalLib():
 
         self.best_params = params
 
-        self.test_size = 0.2
+        self.test_size = 0.1
 
         self.seed = 42
 
         print('Done Initializing.')
+
+    def suggest_max_months(self):
+        limit = self.df[self.target].mean() + self.df[self.target].std()
+        limit = np.ceil(limit)
+        print('Suggested time limitation: {:.0f} months.'.format(limit))
 
     def data_split(self, verbose=True):
         """
@@ -87,8 +94,8 @@ class SurvivalLib():
         df_train, df_test = train_test_split(self.df,
                                              test_size=self.test_size,
                                              shuffle=True,
-                                             random_state=self.seed,
-                                             stratify=self.df[self.event])
+                                             random_state=self.seed,)
+                                             #stratify=self.df[self.event])
         self.df_train = df_train.reset_index(drop=True)
         self.df_test = df_test.reset_index(drop=True)
 
@@ -126,6 +133,10 @@ class SurvivalLib():
         if verbose:
             print('Data cleaned.')
 
+    ########################################################
+    # Getters
+    ########################################################
+
     def get_df(self):
         '''
         Function to return the current pandas DataFrame utilized.
@@ -145,6 +156,30 @@ class SurvivalLib():
 
     def get_E_test(self):
         return self.df_test[self.event].values
+
+    def get_X_train(self):
+        return self.df_train[self.feature_importance[:self.best_num_feats]]
+
+    def get_T_train(self):
+        return self.df_train[self.target].values
+
+    def get_E_train(self):
+        return self.df_train[self.event].values
+
+    def get_cv_score(self):
+        return self.cv_score
+
+    def get_c_index(self):
+
+        features = self.get_X_test()
+        target = self.get_T_test()
+        event = self.get_E_test()
+
+        return concordance_index(self.model_forest, features,
+                                    target, event)
+
+    def get_preds(self):
+        return self.preds
 
     def remove_missing_data(self, verbose=True):
 
@@ -195,6 +230,7 @@ class SurvivalLib():
 
         print('Started processing feature importance. This may take a while.')
 
+        # use whole data to process feature importance
         df = self.df.copy()
 
         # Creating the X, T and E inputs
@@ -313,12 +349,13 @@ class SurvivalLib():
         trainig data, after doing parameters optimization.
         """
 
-        features = self.get_X_test()
-        target = self.get_T_test()
-        event = self.get_E_test()
+        features = self.get_X_train()
+        target = self.get_T_train()
+        event = self.get_E_train()
 
         weights = self.compute_event_weights(event,
                                              balance_classes)
+
 
         params = self.check_params(params)
 
@@ -334,17 +371,6 @@ class SurvivalLib():
         self.model_forest = model_forest
 
 
-    def get_cv_score(self):
-        return self.cv_score
-
-    def get_c_index(self):
-
-        features = self.get_X_test()
-        target = self.get_T_test()
-        event = self.get_E_test()
-
-        return concordance_index(self.model_forest, features,
-                                    target, event)
 
     def optimize_hyperparams(self, verbose=True,):
         """
@@ -365,8 +391,8 @@ class SurvivalLib():
             'min_node_size':[5, 7, 10],
             'max_depth':[4, 5, 6, 7],
             'max_features':['sqrt'],
-            'minprop':[0.08, 0.1, 0.12],
-            'alpha':[0.4, 0.5, 0.6, 0.7],
+            'minprop':[0.08, 0.1, 0.12],     # Greater than zero, less than 1
+            'alpha':[0.01, 0.1, 0.5, 0.8],   # Greater than zero, less than 1
             'sample_size_pct':[0.63],
             'importance_mode':['normalized_permutation', 'impurity']
         }
@@ -385,7 +411,7 @@ class SurvivalLib():
         print(self.best_params)
         self.fit_model()
 
-    def brute_force_num_features(self, min_feats=10, max_feats=150, verbose=True):
+    def brute_force_num_features(self, min_feats=10, max_feats=150, step=10, verbose=True):
         '''
         Computes the best number of features to train the model.
         Uses brute force, so processing is slow.
@@ -403,7 +429,7 @@ class SurvivalLib():
         self._num_feats_optimized = True
         best_res = 0
         best_feats = 0
-        for num_feats in range(min_feats, max_feats, 10):
+        for num_feats in range(min_feats, max_feats, step):
             self.set_best_num_feats(num_feats)
             self.cv_survival(cv=5, verbose=False)
             c_index = self.get_cv_score()
@@ -429,7 +455,7 @@ class SurvivalLib():
             return False
 
 
-    def predict_survival_all_times(self, sample, x_resolution=20):
+    def predict_survival_all_times(self, sample):
         if self.check_not_censored(sample):
             preds = self.model_forest.predict_survival(sample)
             if isinstance(preds, np.ndarray):
@@ -445,11 +471,6 @@ class SurvivalLib():
             else:
                 return None
 
-
-    def predict_risk_all_samples(self, samples, x_resolution=20):
-        preds = self.model_forest.predict_risk(samples)
-        return preds
-
     def predict(self):
         features = self.get_X_test()
         res = features.apply(lambda x: self.predict_survival_all_times(x), axis=1)
@@ -460,6 +481,10 @@ class SurvivalLib():
     def predict_survival_all_samples(self, sample):
         return self.model_forest.predict_survival(sample)
 
+    def predict_risk_all_samples(self, samples):
+        preds = self.model_forest.predict_risk(samples)
+        return preds
+
     def predict_risk(self):
 
         features = self.get_X_test()
@@ -467,8 +492,12 @@ class SurvivalLib():
         res = self.predict_risk_all_samples(features)
 
         self.risk_preds = features.apply(lambda x: self.predict_survival_all_times(x), axis=1)
-        self.high_risk = np.where(res > np.median(res))[0]
-        self.low_risk = np.where(res <= np.median(res))[0]
+        self.pacients_risk_mean = np.mean(res)
+        self.high_risk = np.where(res > self.pacients_risk_mean)[0]
+        self.low_risk = np.where(res <= self.pacients_risk_mean)[0]
+
+        print('Mean risk of patients: {:.3f}'.format(self.pacients_risk_mean))
+
         self.plot_risk()
         return res
 
@@ -479,9 +508,6 @@ class SurvivalLib():
         res = res[res.apply(lambda x: isinstance(x, np.ndarray))].reset_index(drop=True)
         self.hazard_preds = res
         return res
-
-    def get_preds(self):
-        return self.preds
 
     def plot_risk(self):
 
@@ -499,10 +525,11 @@ class SurvivalLib():
                 plt.plot(self.model_forest.times, pred, color='red', label='Alto risco')
 
         kaplan = self.get_kaplan_curve()
+
         kaplan = kaplan.reshape(-1, 1)
         scaler = MinMaxScaler()
         scaled_kaplan = scaler.fit_transform(kaplan)
-        plt.plot(self.model_forest.times, scaled_kaplan, color='black')
+        plt.step(self.model_forest.times, scaled_kaplan, color='black', where='post')
 
         #print('Correct guesses: {:.2f}%'.format((count_right / i) * 100))
         #ax.legend()
