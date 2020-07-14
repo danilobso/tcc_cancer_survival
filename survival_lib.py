@@ -9,6 +9,7 @@ from multiprocessing import Pool, cpu_count
 
 # Ploting
 from matplotlib import pyplot as plt
+from matplotlib.lines import Line2D
 
 # Sklearn
 from sklearn.model_selection import KFold
@@ -19,17 +20,19 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.utils.class_weight import compute_sample_weight
 
 # PySurvival
-from pysurvival.utils.metrics import concordance_index
+from pysurvival.utils.metrics import concordance_index, integrated_brier_score
 from pysurvival.models.survival_forest import ConditionalSurvivalForestModel
-from pysurvival.utils.display import compare_to_actual, integrated_brier_score, display_loss_values
+from pysurvival.utils.display import compare_to_actual,  display_loss_values
 
+from adjustText import adjust_text
 
 class SurvivalLib():
 
     def __init__(self,
                  df,
                  target_col,
-                 del_features,
+                 event_col='OVERALL_SURVIVAL_STATUS',
+                 del_features=[],
                  feature_importance=None,
                  best_num_feats=0,
                  params={}):
@@ -37,6 +40,9 @@ class SurvivalLib():
         print('Initializing...')
         self.df = df
         self.target = target_col
+
+        self.df['desease'] = self.df['DISEASE_FREE_STATUS'].apply(
+                                lambda x: 1 if x == 'DECEASED' else 0)
 
         # Features will be processed after dumming columns
         self.features = []
@@ -74,7 +80,7 @@ class SurvivalLib():
 
     def suggest_max_months(self):
         limit = self.df[self.target].mean() + self.df[self.target].std()
-        limit = np.ceil(limit)
+        limit = np.floor(limit)
         print('Suggested time limitation: {:.0f} months.'.format(limit))
 
     def data_split(self, verbose=True):
@@ -178,6 +184,15 @@ class SurvivalLib():
         return concordance_index(self.model_forest, features,
                                     target, event)
 
+    def get_brier_score(self):
+
+        features = self.get_X_test()
+        target = self.get_T_test()
+        event = self.get_E_test()
+
+        return integrated_brier_score(self.model_forest, features,
+                            target, event)
+
     def get_preds(self):
         return self.preds
 
@@ -217,7 +232,7 @@ class SurvivalLib():
         else:
             return params
 
-    def process_feature_importance(self, num_trees=4000, params={},
+    def process_feature_importance(self, num_trees=500, params={},
                                     balance_classes=True, verbose=True,):
         """
         Function to process the feature importance, in order to
@@ -243,8 +258,92 @@ class SurvivalLib():
         model_forest = ConditionalSurvivalForestModel(num_trees=num_trees,)
         model_forest.fit(X, T, E, seed=self.seed, weights=weights, **params)
 
+        for i in range(0,20):
+
+            tamanho = model_forest.variable_importance_table.shape[0]
+            novo_tamanho = int(0.8 * tamanho)
+
+            print('Tamanho: {}'.format(tamanho))
+            print('Novo Tamanho: {}'.format(novo_tamanho))
+
+            X = X[model_forest.variable_importance_table['feature'].iloc[:novo_tamanho]]
+
+            model_forest = ConditionalSurvivalForestModel(num_trees=num_trees,)
+            model_forest.fit(X, T, E, seed=self.seed, weights=weights, **params)
+
         self.set_feature_importance(model_forest.variable_importance_table['feature'])
 
+    def brute_force_num_features_c_index(self, min_feats=10, max_feats=150, step=10,
+                                        verbose=True, balance_classes=False):
+        '''
+        Computes the best number of features to train the model.
+        Uses brute force, so processing is slow.
+
+        Parameters:
+        -----------
+
+        min_feats: Minimum number of features to start testing.
+        max_feats: Maximum number of features to test.
+
+        '''
+        if verbose:
+            print('Running number of features optimization...')
+
+        self._num_feats_optimized = True
+        best_c_index = 0
+        best_feats = 0
+        for num_feats in range(min_feats, max_feats, step):
+            self.set_best_num_feats(num_feats)
+            self.cv_survival(cv=5, verbose=False)
+            c_index = self.get_cv_score()
+            if (c_index > best_c_index):
+                best_c_index = c_index
+                best_feats = num_feats
+                if verbose:
+                    print('CV Score: {:.3f} Number of features: {}'.format(best_c_index, best_feats))
+
+        self.set_best_num_feats(best_feats)
+
+        if verbose:
+            print('Done optimizing. Best number of features: {}'.format(best_feats))
+
+        self.fit_model()
+
+    def brute_force_num_features_brier(self, min_feats=10, max_feats=150, step=10,
+                                 verbose=True, balance_classes=False):
+        '''
+        Computes the best number of features to train the model.
+        Uses brute force, so processing is slow.
+
+        Parameters:
+        -----------
+
+        min_feats: Minimum number of features to start testing.
+        max_feats: Maximum number of features to test.
+
+        '''
+        if verbose:
+            print('Running number of features optimization...')
+
+        self._num_feats_optimized = True
+        best_bs = 1
+        best_feats = 0
+        for num_feats in range(min_feats, max_feats, step):
+            self.set_best_num_feats(num_feats)
+            self.cv_survival(cv=5, verbose=False)
+            bs = self.get_brier_score()
+            if bs < best_bs:
+                best_bs = bs
+                best_feats = num_feats
+                if verbose:
+                    print('brier_score: {} Number of features: {}'.format(best_bs, best_feats))
+
+        self.set_best_num_feats(best_feats)
+
+        if verbose:
+            print('Done optimizing. Best number of features: {}'.format(best_feats))
+
+        self.fit_model()
 
     def set_feature_importance(self, df):
         self.feature_importance = df
@@ -280,13 +379,14 @@ class SurvivalLib():
 
         if balance_classes:
             weights = compute_sample_weight('balanced', df)
+            #weights = compute_sample_weight({1:2, 0:1}, df)
             weights = weights / df.shape[0]
             #weights[0] += 1 - sum(weights)
 
         return weights
 
     def cv_survival(self, cv=10, params={}, num_trees=1000,
-                    balance_classes=True, verbose=True, ):
+                    balance_classes=False, verbose=True, ):
 
         self.verify_best_num_feats()
 
@@ -313,10 +413,10 @@ class SurvivalLib():
             T_train, T_test = data_train[self.target].values, data_test[self.target].values
             E_train, E_test = data_train[self.event].values, data_test[self.event].values
 
+            weights = self.compute_event_weights(E_train, balance_classes)
+
             X_train = X_train[self.feature_importance[:self.best_num_feats]]
             X_test = X_test[self.feature_importance[:self.best_num_feats]]
-
-            weights = self.compute_event_weights(E_train, balance_classes)
 
             # Creating model
             model_forest = ConditionalSurvivalForestModel(num_trees=num_trees,)
@@ -338,7 +438,7 @@ class SurvivalLib():
     def fit_model(self,
                   num_trees=3000,
                   params={},
-                  balance_classes=True):
+                  balance_classes=False):
         """
         Function used to fit an usable model, with all
         trainig data, after doing parameters optimization.
@@ -348,8 +448,8 @@ class SurvivalLib():
         target = self.get_T_train()
         event = self.get_E_train()
 
-        weights = self.compute_event_weights(event,
-                                             balance_classes)
+        #weights = self.compute_event_weights(self.df_train['DISEASE_FREE_STATUS_RECURRED/PROGRESSED'], balance_classes)
+        weights = self.compute_event_weights(event, balance_classes)
 
 
         params = self.check_params(params)
@@ -381,15 +481,16 @@ class SurvivalLib():
             'importance_mode':['normalized_permutation']
         }
         """
+        features = self.get_X_train().shape[1]
 
         param_grid = {
-            'min_node_size':[5, 7, 10],
-            'max_depth':[4, 5, 6, 7],
+            'min_node_size':[5, 7, 8, 10],
+            'max_depth':[4, 5, 6, 7, 8],
             'max_features':['sqrt'],
-            'minprop':[0.08, 0.1, 0.12],     # Greater than zero, less than 1
-            'alpha':[0.01, 0.1, 0.5, 0.8],   # Greater than zero, less than 1
+            #'minprop':[0.08, 0.1, 0.12],     # Greater than zero, less than 1
+            #'alpha':[0.01, 0.1, 0.5],   # Greater than zero, less than 1
             'sample_size_pct':[0.63],
-            'importance_mode':['normalized_permutation', 'impurity']
+            'importance_mode':['normalized_permutation']
         }
 
         grid = ParameterGrid(param_grid)
@@ -406,41 +507,45 @@ class SurvivalLib():
         print(self.best_params)
         self.fit_model()
 
-    def brute_force_num_features(self, min_feats=10, max_feats=150, step=10, verbose=True):
-        '''
-        Computes the best number of features to train the model.
-        Uses brute force, so processing is slow.
+    def optimize_hyperparams_brier(self, verbose=True,):
+        """
+        Hyperparameter optimization. Default values are as follow:
 
-        Parameters:
-        -----------
+        param_grid = {
+            'min_node_size':[10],
+            'max_depth':[5],
+            'max_features':['sqrt']
+            'minprop':[0.1],
+            'alpha':[0.5],
+            'sample_size_pct':[0.63],
+            'importance_mode':['normalized_permutation']
+        }
+        """
+        features = self.get_X_train().shape[1]
 
-        min_feats: Minimum number of features to start testing.
-        max_feats: Maximum number of features to test.
+        param_grid = {
+            'min_node_size':[5, 7, 8, 10],
+            'max_depth':[4, 5, 6, 7, 8],
+            'max_features':['sqrt'],
+            #'minprop':[0.08, 0.1, 0.12],     # Greater than zero, less than 1
+            #'alpha':[0.01, 0.1, 0.5],   # Greater than zero, less than 1
+            'sample_size_pct':[0.63],
+            'importance_mode':['normalized_permutation']
+        }
 
-        '''
-        if verbose:
-            print('Running number of features optimization...')
-
-        self._num_feats_optimized = True
-        best_res = 0
-        best_feats = 0
-        for num_feats in range(min_feats, max_feats, step):
-            self.set_best_num_feats(num_feats)
-            self.cv_survival(cv=5, verbose=False)
-            c_index = self.get_cv_score()
-            if c_index > best_res:
-                best_res = c_index
-                best_feats = num_feats
+        grid = ParameterGrid(param_grid)
+        best_brier = 1
+        for i, params in enumerate(grid):
+            self.cv_survival(cv=5, verbose=False, params=params)
+            bs = self.get_brier_score()
+            if bs < best_brier:
+                best_brier = bs
+                self.best_params = params
+                self.brier_score = best_brier
                 if verbose:
-                    print('CV Score: {:.3f} Number of features: {}'.format(best_res, best_feats))
-
-        self.set_best_num_feats(best_feats)
-
-        if verbose:
-            print('Done optimizing. Best number of features: {}'.format(best_feats))
-
+                    print('Run: {} Brier: {:.3f}'.format(i+1, best_brier))
+        print(self.best_params)
         self.fit_model()
-
 
     def check_not_censored(self, sample):
         event = self.df_test[self.event].values
@@ -449,14 +554,13 @@ class SurvivalLib():
         else:
             return False
 
-
     def predict_survival_all_times(self, sample):
-        if self.check_not_censored(sample):
-            preds = self.model_forest.predict_survival(sample)
-            if isinstance(preds, np.ndarray):
-                return preds[0]
-            else:
-                return None
+        #if self.check_not_censored(sample):
+        preds = self.model_forest.predict_survival(sample)
+        if isinstance(preds, np.ndarray):
+            return preds[0]
+        else:
+            return None
 
     def predict_hazard_all_times(self, sample, x_resolution=20):
         if self.check_not_censored(sample):
@@ -487,7 +591,8 @@ class SurvivalLib():
         res = self.predict_risk_all_samples(features)
 
         self.risk_preds = features.apply(lambda x: self.predict_survival_all_times(x), axis=1)
-        self.pacients_risk_mean = np.mean(res)
+        print(self.risk_preds)
+        self.pacients_risk_mean = np.median(res)
         self.high_risk = np.where(res > self.pacients_risk_mean)[0]
         self.low_risk = np.where(res <= self.pacients_risk_mean)[0]
 
@@ -512,12 +617,29 @@ class SurvivalLib():
         event_times = target[np.where(event == 1)[0]]
         f, ax = plt.subplots(figsize=(10,10))
 
-        for pred in self.risk_preds.iloc[self.low_risk]:
+        texts = []
+
+        for i, pred in enumerate(self.risk_preds.iloc[self.low_risk]):
             if isinstance(pred, np.ndarray):
+                half = len(pred)//2
+                # texts.append(plt.text(self.model_forest.times[half],
+                #              pred[half],
+                #              '{}'.format(self.get_T_test()[self.low_risk[i]])))
                 plt.plot(self.model_forest.times, pred, color='green', label='Baixo risco')
-        for pred in self.risk_preds.iloc[self.high_risk]:
+
+        for i, pred in enumerate(self.risk_preds.iloc[self.high_risk]):
             if isinstance(pred, np.ndarray):
+                half = len(pred)//2
+                # texts.append(plt.text(self.model_forest.times[half],
+                #                       pred[half],
+                #                       '{}'.format(self.get_T_test()[self.high_risk[i]])))
                 plt.plot(self.model_forest.times, pred, color='red', label='Alto risco')
+
+        # adjust_text(texts)
+
+        custom_lines = [Line2D([0], [0], color='green', lw=4),
+                        Line2D([0], [0], color='red', lw=4),
+                        Line2D([0], [0], color='black', lw=4)]
 
         kaplan = self.get_kaplan_curve()
 
@@ -526,11 +648,11 @@ class SurvivalLib():
         scaled_kaplan = scaler.fit_transform(kaplan)
         plt.step(self.model_forest.times, scaled_kaplan, color='black', where='post')
 
-        #print('Correct guesses: {:.2f}%'.format((count_right / i) * 100))
-        #ax.legend()
+        ax.legend(custom_lines, ['Baixo risco', 'Alto risco', 'Kaplan Curve'])
         ax.set_ylabel('Probabilidade de sobrevivência')
-        ax.set_xlabel('Tempo em meses após primeiro diagnóstico')
-        ax.set_title('Comparação de curvas de sobrevivência para pacientes não censored')
+        ax.set_xlabel('Tempo após primeiro diagnóstico (meses)')
+        #ax.set_title('Comparação de curvas de sobrevivência para pacientes não cesurados')
+        #plt.savefig('msr_rf_cindex.png', dpi=200)
         plt.show()
 
 
